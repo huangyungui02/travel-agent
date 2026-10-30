@@ -1,0 +1,12 @@
+[project]
+name = "travel-agent"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = [
+    "deepagents>=0.7.32",
+    "langchain>=1.4.7",
+    "langchain-mcp-adapters>=0.3.2",
+    "langchain-openai>=1.7.3",
+    "langgraph-cli[inmem]>=0.4.40",
+    "python-dotenv>=1.2.4",
+]
