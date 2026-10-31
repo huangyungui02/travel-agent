@@ -25,19 +25,19 @@ ROOT = Path(__file__).resolve().parent
 load_dotenv(ROOT / ".env")
 
 
-@tool
-async def flyai(
-    command: Literal[
-        "keyword-search", "ai-search", "search-flight", "search-train",
-        "search-hotel", "search-poi", "search-marriott-hotel",
-        "search-marriott-package",
-    ],
-    arguments: list[str],
-) -> str:
-    """调用飞猪官方 CLI。先阅读 /skills/flyai/ 下的 skill 和对应 references。
+FlyaiCommand = Literal[
+    "keyword-search", "ai-search", "search-flight", "search-train",
+    "search-hotel", "search-poi", "search-marriott-hotel", "search-marriott-package",
+]
 
-    arguments 是参数数组，例如 ["--query", "杭州三日游"]；可传 ["--help"]。
-    仅支持旅行搜索命令，不支持 shell、配置、下单或支付。
+
+@tool
+async def flyai(command: FlyaiCommand, arguments: list[str]) -> str:
+    """调用飞猪官方 CLI。先阅读 /skills/flyai/SKILL.md 和对应 references。
+
+    command 为允许的搜索命令；arguments 是独立参数数组，例如 ["--query", "杭州三日游"]。
+    查看帮助可传 ["--help"]。按文档使用参数，不猜字段，不拼接 shell。
+    仅支持搜索与帮助，不支持配置、下单或支付。
     """
     executable = ROOT / "node_modules" / ".bin" / "flyai"
     if not executable.exists():
@@ -67,7 +67,7 @@ def current_date() -> str:
     return datetime.now(ZoneInfo("Asia/Shanghai")).isoformat(timespec="seconds")
 
 
-def build_agent(model, tools):
+def build_agent(model, tools, *, checkpointer=None):
     """Compile the harness; LangGraph dev supplies its own persistence."""
     system_prompt = (ROOT / "system_prompt.md").read_text(encoding="utf-8")
     register_harness_profile(
@@ -91,6 +91,7 @@ def build_agent(model, tools):
         skills=["/skills/"],
         permissions=[FilesystemPermission(paths=["/skills/**"], operations=["write"], mode="deny")],
         system_prompt=system_prompt,
+        checkpointer=checkpointer,
     )
 
 
