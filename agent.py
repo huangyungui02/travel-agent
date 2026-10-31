@@ -70,6 +70,7 @@ def current_date() -> str:
 def build_agent(model, tools, *, checkpointer=None):
     """Compile the harness; LangGraph dev supplies its own persistence."""
     system_prompt = (ROOT / "system_prompt.md").read_text(encoding="utf-8")
+    daily_planner_prompt = (ROOT / "daily_planner_prompt.md").read_text(encoding="utf-8")
     register_harness_profile(
         "openai",
         HarnessProfile(
@@ -77,19 +78,42 @@ def build_agent(model, tools, *, checkpointer=None):
             excluded_tools=frozenset({"execute"}),
         ),
     )
+    shared_tools = [
+        current_date, flyai, *tools,
+        {"type": "web_search"},
+    ]
+    backend = CompositeBackend(
+        default=StateBackend(),
+        routes={"/skills/": FilesystemBackend(root_dir=ROOT / "skills", virtual_mode=True)},
+    )
+    daily_planner = create_deep_agent(
+        name="daily_planner",
+        model=model,
+        tools=shared_tools,
+        backend=backend,
+        skills=["/skills/"],
+        permissions=[
+            FilesystemPermission(paths=["/skills/**", "/travel-outline.md"], operations=["write"], mode="deny"),
+        ],
+        system_prompt=daily_planner_prompt,
+        checkpointer=True,
+    )
     return create_deep_agent(
         name="travel_agent",
         model=model,
-        tools=[
-            current_date, flyai, *tools,
-            {"type": "web_search"},
-        ],
-        backend=CompositeBackend(
-            default=StateBackend(),
-            routes={"/skills/": FilesystemBackend(root_dir=ROOT / "skills", virtual_mode=True)},
-        ),
+        tools=shared_tools,
+        backend=backend,
         skills=["/skills/"],
-        permissions=[FilesystemPermission(paths=["/skills/**"], operations=["write"], mode="deny")],
+        permissions=[
+            FilesystemPermission(paths=["/skills/**", "/daily-itinerary.md"], operations=["write"], mode="deny"),
+        ],
+        subagents=[
+            {
+                "name": "daily_planner",
+                "description": "根据已确认的 /travel-outline.md 细化或修改每日具体行程，维护 /daily-itinerary.md 并返回摘要。",
+                "runnable": daily_planner,
+            },
+        ],
         system_prompt=system_prompt,
         checkpointer=checkpointer,
     )

@@ -1,22 +1,22 @@
 # 旅行 Agent
 
-单个旅行 Deep Agent，使用 `qwen3.8-flash`，在 LangGraph Studio 中完成需求澄清、交通酒店查询、预算规划、行程细化和反复修改。
+基于 Deep Agents 构建的旅行规划系统，使用 `qwen3.8-flash`，由主代理（`travel_agent`）与每日行程子代理（`daily_planner`）通过双 Markdown 文件协作，在 LangGraph Studio 中完成需求澄清、交通酒店查询、预算规划、行程细化和反复修改。
 
 - 百炼原生 `web_search`：查询攻略、开放时间、预约要求和最新公告。
 - 高德 HTTP MCP：地点、路线和可查询的天气，工具由服务端动态发现。
 - 飞猪官方 skill + CLI：自然语言查询交通、酒店和门票。
-- 原生线程文件工具：用 Markdown 记录需求、预算、已确认安排和完整行程。
-- 关闭通用子代理与 shell；由主 agent 规划全部天数，不代客下单或支付。
+- 双文件职责隔离：
+  - `/travel-outline.md`（主代理读写，子代理只读）：记录需求、预算、已订项目、大交通与酒店候选及确认的每日行程骨架。
+  - `/daily-itinerary.md`（子代理读写，主代理只读）：记录每日分时段详细行程、动线耗时、餐饮门票与分项预算。
+- 关闭通用子代理与 shell；仅开放专用 `daily_planner` 子代理负责每日细节规划，不代客下单或支付。
 
 ## 规划与记录
 
-先了解需求，再查少量交通酒店候选、规划费用和每日骨架。用户自然确认交通、酒店和骨架后，主 agent 同轮继续详细规划，不需要固定口令或再次回复“继续”。用户可以反复修改，影响已确认安排时再商量取舍。
+先由主 agent 了解需求、查少量交通酒店候选、规划费用和每日骨架，并维护在虚拟文件 `/travel-outline.md` 中。用户自然确认交通、酒店和骨架后，主 agent 更新 `/travel-outline.md` 并同轮调用 `task(subagent_type="daily_planner")` 委派子代理读取 `/travel-outline.md`、生成 `/daily-itinerary.md`，再由主 agent 读取并呈现给用户。
 
-主 agent 在虚拟文件 `/travel-plan.md` 中用自然语言保存工作笔记，通过内置 `read_file`、`write_file`、`edit_file` 维护。笔记可以用标题、段落和表格，不要求 JSON 字段、阶段枚举、版本号或额外业务工具。
+用户可以反复修改：仅涉及每日具体安排时，主 agent 委派 `daily_planner` 局部修订 `/daily-itinerary.md`；涉及大交通、酒店、总预算或整体骨架变更时，主 agent 先更新 `/travel-outline.md` 并与用户确认，再调用子代理同步更新详细行程。
 
-需求、预算与确认由主 agent 结合对话和笔记处理。它需要检查人数、房间数、晚数、已付与待付、共享费用和每日额度，标清报价、估算与未知费用，不重复计费。每轮保存后仍要向用户展示方案或问题。
-
-笔记由 `StateBackend` 保存到线程状态，`langgraph dev` 管理检查点；同一线程可以继续，换线程不会自动读取另一趟旅行。虚拟文件不会直接写入项目目录。最终确认后，主 agent 把完整方案写入同一份笔记。当前没有跨线程方案库或前端路线导出。
+两份文件均由 `StateBackend` 保存到线程状态，`langgraph dev` 管理检查点；同一线程可以继续，换线程相互隔离，并由 `FilesystemPermission` 强制保证主／子代理各自的写入边界。
 
 主 agent 阅读飞猪官方 skill 与参数文档后，直接调用 `flyai(command, arguments)` 执行 CLI。
 工具使用允许的搜索命令和独立参数数组，不经过额外模型转换。高德使用原生 MCP 接口。
@@ -51,6 +51,8 @@ uv run langgraph dev
 
 打开终端输出的 Studio 链接，选择 `travel_agent`。启动时不连接远程工具，实际对话时才加载模型和高德 MCP。
 
+本地 dev 默认“关闭就停止”：正常关闭服务时取消未完成任务；重启时先取消上次遗留的 `pending`／`running` 任务，不自动续跑。对话历史、检查点和旅行笔记仍然保留，可以由用户发送新消息继续。强制终止进程时，清理会在下次启动执行。此策略由 `dev_server.py` 的 HTTP lifespan 钩子实现，使用本地 in-memory runtime 的取消接口；升级服务端依赖后需验证生命周期顺序。若要恢复框架默认的重启续跑行为，移除 `langgraph.json` 中的 `http.app` 配置。关闭浏览器页面不等于关闭服务。
+
 可以这样连续对话：
 
 1. `我想从上海去杭州玩三天，先帮我明确需求。`
@@ -73,10 +75,11 @@ uv run python -m unittest -v
 
 ## 文件
 
-- `agent.py`：模型与工具组装、飞猪 CLI 查询、异步图工厂。
-- `system_prompt.md`：完整旅行助手职责和自然语言笔记约定。
-- `test_agent.py`：原生工具与线程笔记的离线集成检查。
-- `plan.md`：当前精简方案与后续交付计划。
+- `agent.py`：主／子代理与工具组装、双文件权限配置、飞猪 CLI 查询、异步图工厂。
+- `dev_server.py`：本地 dev 启停时取消未完成任务，保留对话和笔记。
+- `system_prompt.md`：主代理旅行助手职责与 `/travel-outline.md` 维护约定。
+- `daily_planner_prompt.md`：`daily_planner` 子代理职责与 `/daily-itinerary.md` 编排约定。
+- `test_agent.py`：原生工具、双文件权限、线程隔离与子代理委派的离线集成检查。
 
 ## 官方资料
 
