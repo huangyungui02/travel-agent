@@ -1,6 +1,7 @@
 """Travel Deep Agent, exposed as an async LangGraph graph factory."""
 
 import asyncio
+import logging
 import os
 from datetime import datetime
 from pathlib import Path
@@ -24,6 +25,8 @@ from daily_planner import build_daily_planner
 
 ROOT = Path(__file__).resolve().parent
 load_dotenv(ROOT / ".env")
+# MCP credentials are carried in query parameters; HTTP request logs include URLs.
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
 
 FlyaiCommand = Literal[

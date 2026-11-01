@@ -1,0 +1,34 @@
+name: travel-agent
+services:
+  agent:
+    build: .
+    init: true
+    env_file: .env
+    environment:
+      LANGSMITH_TRACING: "false"
+    ports:
+      - "127.0.0.1:8123:8123"
+    volumes:
+      - agent-data:/app/.langgraph_api
+    stop_grace_period: 30s
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "/app/.venv/bin/python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8123/ok', timeout=5)",
+        ]
+      interval: 10s
+      timeout: 6s
+      retries: 6
+      start_period: 30s
+  web:
+    build: ./web
+    ports:
+      - "127.0.0.1:8080:80"
+    depends_on:
+      agent:
+        condition: service_healthy
+volumes:
+  agent-data:

@@ -1,0 +1,12 @@
+.git
+.env
+.env.*
+.venv
+node_modules
+.langgraph_api
+.agents
+.codex
+__pycache__
+.ruff_cache
+web
+*.egg-info

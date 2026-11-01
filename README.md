@@ -1,17 +1,65 @@
 # 旅行 Agent
 
+## Web 与 Docker 本地联调
+
+前端位于 `web/`，采用 React、TypeScript、Vite、React Router、Tailwind CSS 和 LangChain 官方 React SDK。支持流式聊天、历史会话、工具活动、停止后台任务，以及 Markdown 行程查看和下载。布局适配手机，后续可接入 Tauri；当前尚未加入 Tauri 工程。
+
+当前按本地开发部署：Docker 内运行 `langgraph dev`，不需要 LangSmith。它使用开发运行时与持久卷，不是 PostgreSQL/Redis 生产版 Agent Server。没有用户鉴权，只绑定本机端口。
+
+先在项目根目录 `.env` 配置模型、高德和飞猪密钥，再启动 Docker 引擎：
+
+```bash
+docker compose up --build -d
+```
+
+打开 http://localhost:8080 。Agent API 位于 http://localhost:8123 ，Web 经 `/api` 反向代理访问，流式代理已关闭缓冲。镜像内包含 Python 依赖、Node.js、飞猪 CLI、提示词与 skills；密钥只在运行时注入，不进入镜像和前端。
+
+前端热更新开发可以只启动 Agent 容器：
+
+```bash
+docker compose up --build -d agent
+npm ci --prefix web
+npm run dev --prefix web
+```
+
+打开 http://localhost:5173 。Vite 默认将 `/api` 转发至 `http://127.0.0.1:8123`；使用已有非 Docker 服务时可用 `AGENT_SERVER_URL=http://127.0.0.1:2024 npm run dev --prefix web`。前端只读取 `VITE_AGENT_API_URL` 这一公开配置，绝不能把服务端密钥加上 `VITE_` 前缀。
+
+`langgraph.docker.json` 不读取镜像内的 `.env`，环境变量由 Compose 注入。它沿用本地开发运行时专用的启停清理策略：停止服务即取消任务，重启不恢复遗留任务；聊天和 `/daily-itinerary.md` 随 `/app/.langgraph_api` 保存在 `agent-data` 卷中。`docker compose down` 保留数据，`docker compose down -v` 会删除数据。
+
+```bash
+# 检查服务与日志
+docker compose ps
+docker compose logs -f agent
+# 停止服务，保留会话
+docker compose down
+# 验证前端构建及 Python 集成
+npm run build --prefix web
+.venv/bin/python -m unittest test_agent -q
+# 浏览器测试，需已有 Vite 或 Docker Web 服务
+cd web
+npx playwright install chromium
+npm run test:e2e
+# 可选真实模型验证（会调用所配置模型）
+LIVE_AGENT_TEST=1 npm run test:e2e
+# 验证完整 Docker Web，可指定 WEB_URL=http://127.0.0.1:8080
+```
+
+移动设备上的 localhost 指向设备本身。后续 Tauri 真机接入时需配置可访问的 API 域名、HTTPS、跨域来源和登录鉴权；不在安装包中嵌入模型或工具密钥。
+
+## 代理分工
+
 基于 Deep Agents 构建的旅行规划系统，使用 `qwen3.8-flash`。主代理与用户确认交通、住宿、预算、必去项目与旅行偏好后，用自然语言委派 `daily_planner`；子代理通过原生 `write_file` / `edit_file` 保存 Markdown 行程文件，主代理通过 `read_file` 读取并展示。
 
 - 百炼原生 `web_search`：查询攻略、开放时间、预约要求和最新公告。
 - 高德 HTTP MCP：地点、路线和可查询的天气，工具由服务端动态发现。
 - 飞猪官方 skill + CLI：查询交通、酒店和门票。
 - 子代理保留同一线程的委派、查询和行程历史；局部修改只需说明变更，无须重传全部需求。
-- Outline 通过自然语言委派，完整详细行程通过当前线程的 Markdown 文件交付。
+- 需求和偏好通过自然语言委派，完整详细行程通过当前线程的 Markdown 文件交付。
 - 关闭通用子代理与 shell；仅开放专用 `daily_planner`，不代客下单或支付。
 
 ## 规划与 Markdown 交付
 
-主代理与用户确认具体到离时间、地点、逐晚住宿、预算和旅行偏好 后，用自然语言委派 `daily_planner`。主代理帮助筛选感兴趣的景点、餐厅与体验，不预先分配每日地点或路线；子代理根据必去项目、候选和固定预约统筹全部天数。子代理保留同一线程的历史，局部修改只需说明变更，每次提交全部天数的完整行程。
+主代理与用户确认具体到离时间、地点、逐晚住宿、预算和旅行偏好后，用自然语言委派 `daily_planner`。主代理帮助筛选感兴趣的景点、餐厅与体验，不预先分配每日地点或路线；子代理根据必去项目、候选和固定预约统筹全部天数。子代理保留同一线程的历史，局部修改只需说明变更，每次提交全部天数的完整行程。
 
 子代理首次用 `write_file` 创建 `/daily-itinerary.md`，后续先读取，再用 `edit_file` 修改，文件保留全部天数的最新行程。保存成功后简短报告完成。主代理对该文件的写入由框架权限明确拒绝，子代理可创建和修改。主代理通过 `read_file` 读取并向用户展示，内容截断时继续分页读取。表格列为 `时间 | 活动 | 描述 | 链接 | 预计费用`。
 
@@ -23,7 +71,7 @@
 
 ## 安装与配置
 
-需要 uv、Python 3.12+、Node.js 18+。已有 `.env` 时不要覆盖。
+需要 uv、Python 3.12+；Web 开发推荐 Node.js 22 LTS 或更新的受支持版本。已有 `.env` 时不要覆盖。
 
 ```sh
 uv sync --locked
