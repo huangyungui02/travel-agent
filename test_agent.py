@@ -1,16 +1,52 @@
-"""Offline checks for native tools, two-file Markdown memory, and daily_planner subagent."""
+"""Offline checks for native tools, Markdown files, and persistent delegation."""
 
+import asyncio
 import json
 import unittest
 from unittest.mock import AsyncMock, patch
 
 import httpx2 as httpx
 import openai
+from langchain.tools import tool
 from langchain_core.messages import HumanMessage
 from langchain_openai import ChatOpenAI
 from langgraph.checkpoint.memory import InMemorySaver
 
+from pydantic import ValidationError
+
 from agent import build_agent
+from itinerary import Itinerary
+
+
+def sample_itinerary():
+    days = []
+    for number, name in enumerate(["西湖", "灵隐登山", "河坊街"], 1):
+        days.append({
+            "date": f"2026-11-0{number}", "title": name,
+            "items": [
+                {"kind": "place", "id": f"d{number}-sight", "start_time": "11:00:00", "end_time": "12:00:00",
+                 "activity": f"游览{name}", "description": "开放时间待核实", "cost": 0.0,
+                 "links": [{"title": "官网", "url": "https://example.com/"}],
+                 "place_name": name, "coordinates": {"longitude": 120.15, "latitude": 30.25}},
+                {"kind": "route", "id": f"d{number}-route", "start_time": "12:00:00", "end_time": "12:20:00",
+                 "activity": "步行至餐厅", "description": "沿湖步行", "cost": 0.0, "links": [],
+                 "from_stop_id": f"d{number}-sight", "to_stop_id": f"d{number}-restaurant", "transport_modes": ["walking"]},
+                {"kind": "place", "id": f"d{number}-restaurant", "start_time": "12:20:00", "end_time": "13:00:00",
+                 "activity": "吃午餐", "description": "两人合计估算", "cost": 100.0, "links": [],
+                 "place_name": "湖滨就餐区域", "coordinates": None},
+            ],
+        })
+    return {"title": "杭州三日游", "travelers": 2, "days": days}
+
+
+def sample_plan(second_day="灵隐登山"):
+    return (
+        "杭州三日游，2026-11-01至11-03，两位成人。"
+        f"三天分别游览西湖、{second_day}、河坊街。"
+        "每天11:00-12:00游览（免费），12:00-12:20沿湖步行至餐厅（免费），"
+        "12:20-13:00在湖滨就餐区域吃午餐（两人合计估算100元）。"
+        "景点高德经度120.15、纬度30.25，开放时间待核实，官网https://example.com/；餐饮区域坐标待核实。"
+    )
 
 
 class AgentIntegrationTest(unittest.IsolatedAsyncioTestCase):
@@ -39,21 +75,33 @@ class AgentIntegrationTest(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(payload["enable_thinking"])
         self.assertNotIn("previous_response_id", payload)
         self.assertNotEqual(payload.get("text", {}).get("format", {}).get("type"), "json_schema")
+        # DashScope Responses only accepts required mode with exactly one tool.
+        if payload.get("tool_choice") == "required" and len(payload["tools"]) != 1:
+            return httpx.Response(400, json={"error": {"message": "Please set one tool in required mode.",
+                                                       "type": "InvalidParameter", "code": "InvalidParameter"}})
         names = {t.get("name") for t in payload["tools"]}
+        self.assertNotIn("ConversionResult", names)
+        self.assertNotEqual(payload.get("tool_choice"), "required")
         self.assertTrue({"read_file", "write_file", "edit_file", "flyai", "current_date"} <= names)
-        self.assertFalse(names & {"execute", "get_travel_draft", "update_travel_requirements",
-                                  "submit_travel_outline", "confirm_travel_outline"})
+        self.assertNotIn("execute", names)
+        self.assertNotIn("submit_itinerary", names)
+        self.assertNotIn("read_itinerary", names)
         task_tools = [t for t in payload["tools"] if t.get("name") == "task"]
         if task_tools:
+            self.assertNotIn("submit_itinerary", names)
             self.assertIn("- daily_planner:", task_tools[0]["description"])
             self.assertNotIn("- general-purpose:", task_tools[0]["description"])
         self.assertEqual([t for t in payload["tools"] if t["type"] != "function"], [{"type": "web_search"}])
         step = self.steps.pop(0)
         index = len(self.requests)
-        if isinstance(step, tuple):
-            name, args = step[0], json.dumps(step[1])
-            output = [{"type": "function_call", "id": f"fc_{index}", "call_id": f"call_{index}",
-                       "name": name, "arguments": args, "status": "completed"}]
+        if isinstance(step, (tuple, list)):
+            calls = [step] if isinstance(step, tuple) else step
+            output = []
+            for offset, (name, args) in enumerate(calls):
+                self.assertIn(name, names)
+                output.append({"type": "function_call", "id": f"fc_{index}_{offset}",
+                               "call_id": f"call_{index}_{offset}", "name": name,
+                               "arguments": json.dumps(args), "status": "completed"})
         else:
             annotations = ([{"type": "url_citation", "url": "https://example.com/", "title": "来源",
                              "start_index": 0, "end_index": 4}] if self.citations else [])
@@ -94,80 +142,128 @@ class AgentIntegrationTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("https://example.com/", json.dumps(result["messages"][-1].content))
         self.assertEqual(len(self.requests), 4)
 
-    async def test_markdown_notes_restore_and_threads_are_isolated(self):
-        note = "# 杭州旅行骨架\n两位成人，预算共4000元。交通、酒店和每日骨架待用户确认。"
-        await self.turn("记住旅行需求", ("write_file", {"file_path": "/travel-outline.md", "content": note}), "需求已记录。")
+    async def test_markdown_delivery_revision_and_thread_isolation(self):
+        from deepagents.backends.utils import file_data_to_string
+        ITINERARY_PATH = "/daily-itinerary.md"
+
+        original = "# 杭州三日游\n\n| 时间 | 活动 | 描述 | 链接 | 预计费用 |\n|---|---|---|---|---|\n| 11:00–12:00 | 西湖 | 游览 | — | ¥0 |"
+        outline = "已确认杭州三天，第一天西湖，第二天登山，第三天返程。"
+        result = await self.turn(
+            "请细化",
+            ("task", {"subagent_type": "daily_planner", "description": outline}),
+            ("write_file", {"file_path": ITINERARY_PATH, "content": original}),
+            "完整行程已保存。",
+            ("read_file", {"file_path": "/daily-itinerary.md"}),
+            original,
+        )
+        self.assertEqual(file_data_to_string(result["files"][ITINERARY_PATH]), original)
+        self.assertIn("西湖", result["messages"][-2].text)
+        self.assertNotIn("itinerary", result)
         self.agent = build_agent(self.model, [], checkpointer=self.saver)
+        revised = original.replace("西湖", "浙江省博物馆")
         result = await self.turn(
-            "预算改成3000元", ("read_file", {"file_path": "/travel-outline.md"}),
-            ("edit_file", {"file_path": "/travel-outline.md", "old_string": "4000元", "new_string": "3000元"}),
-            "预算已改为两人共3000元，其他需求保留。",
+            "改成博物馆",
+            ("task", {"subagent_type": "daily_planner", "description": "改成浙江省博物馆，其余保留。"}),
+            ("edit_file", {"file_path": ITINERARY_PATH, "old_string": "西湖", "new_string": "浙江省博物馆"}),
+            "修改已保存。",
+            ("read_file", {"file_path": "/daily-itinerary.md"}),
+            revised,
         )
-        self.assertIn("4000元", [m.text for m in result["messages"] if m.type == "tool"][-2])
-        self.assertNotIn("travel", result)
-        result = await self.turn("查看笔记", ("read_file", {"file_path": "/travel-outline.md"}), "预算为3000元。")
-        self.assertIn("3000元", result["messages"][-2].text)
-        isolated = await self.turn("你好", "你好，想去哪里旅行？", config={"configurable": {"thread_id": "trip-b"}})
-        self.assertNotIn("/travel-outline.md", isolated.get("files", {}))
+        self.assertIn("浙江省博物馆", result["messages"][-2].text)
+        self.assertEqual(file_data_to_string(result["files"][ITINERARY_PATH]), revised)
+        self.assertIn(outline, json.dumps(self.requests[-4]["input"], ensure_ascii=False))
+        result = await self.turn("读取行程", ("read_file", {"file_path": "/daily-itinerary.md"}), "尚未保存行程。",
+                                 config={"configurable": {"thread_id": "trip-b"}})
+        self.assertIn("not found", result["messages"][-2].text)
+        self.assertNotIn(ITINERARY_PATH, result.get("files", {}))
 
-    async def test_confirmation_delegates_to_subagent_and_supports_partial_revision(self):
+    async def test_unfinished_revision_preserves_saved_file(self):
+        from deepagents.backends.utils import file_data_to_string
+        ITINERARY_PATH = "/daily-itinerary.md"
+
         await self.turn(
-            "给一个三天骨架",
-            ("write_file", {"file_path": "/travel-outline.md", "content": "三天杭州行程，交通酒店和骨架待确认。"}),
-            "请确认这套大交通、酒店和三天骨架，或提出修改。",
+            "生成初稿",
+            ("task", {"subagent_type": "daily_planner", "description": "已确认行程"}),
+            ("write_file", {"file_path": ITINERARY_PATH, "content": "# 原始完整行程"}), "行程已保存。",
+            ("read_file", {"file_path": "/daily-itinerary.md"}), "原始行程。",
         )
-        detail_v1 = "# 每日详细行程\n- Day 1：湖滨慢走\n- Day 2：灵隐飞来峰登山\n- Day 3：河坊街返程"
         result = await self.turn(
-            "好的，就按这个来，继续细化",
-            ("read_file", {"file_path": "/travel-outline.md"}),
-            ("edit_file", {"file_path": "/travel-outline.md", "old_string": "待确认", "new_string": "用户已确认"}),
-            ("task", {"subagent_type": "daily_planner", "description": "请读取 /travel-outline.md 并生成 /daily-itinerary.md"}),
-            # Subagent execution steps:
-            ("read_file", {"file_path": "/travel-outline.md"}),
-            ("write_file", {"file_path": "/daily-itinerary.md", "content": detail_v1}),
-            "已完成三天详细行程并写入 /daily-itinerary.md。",
-            # Main agent resumes after subagent finishes:
-            ("read_file", {"file_path": "/daily-itinerary.md"}),
-            "详细行程已为您生成：第一天湖滨慢走，第二天灵隐飞来峰登山，第三天河坊街返程。",
+            "换酒店",
+            ("task", {"subagent_type": "daily_planner", "description": "请更换酒店"}),
+            "请先确认酒店分店，暂未修改行程。",
+            "请确认酒店分店。",
         )
-        self.assertIn("详细行程已为您生成", result["messages"][-1].text)
-        self.assertIn("/daily-itinerary.md", result["files"])
+        self.assertIn("请先确认酒店分店", result["messages"][-2].text)
+        self.assertEqual(file_data_to_string(result["files"][ITINERARY_PATH]), "# 原始完整行程")
 
-        # Partial revision delegated to subagent:
-        result2 = await self.turn(
-            "第二天不要登山，改成浙江省博物馆",
-            ("task", {"subagent_type": "daily_planner", "description": "第二天不要登山，改为浙江省博物馆，请更新 /daily-itinerary.md"}),
-            # Subagent execution steps:
-            ("read_file", {"file_path": "/travel-outline.md"}),
-            ("read_file", {"file_path": "/daily-itinerary.md"}),
-            ("edit_file", {"file_path": "/daily-itinerary.md", "old_string": "灵隐飞来峰登山", "new_string": "浙江省博物馆室内参观"}),
-            "已将第二天修改为浙江省博物馆室内参观，其余安排保留。",
-            # Main agent resumes:
-            ("read_file", {"file_path": "/daily-itinerary.md"}),
-            "已为您将第二天调整为浙江省博物馆室内参观，第一天和第三天保持不变。",
-        )
-        self.assertIn("浙江省博物馆", result2["messages"][-1].text)
-        self.assertIn("浙江省博物馆", result2["files"]["/daily-itinerary.md"]["content"])
-        # Verify subagent retained its prior conversation/thinking history from the first invocation:
-        subagent_req_input = json.dumps(self.requests[-3]["input"], ensure_ascii=False)
-        self.assertIn("请读取 /travel-outline.md 并生成 /daily-itinerary.md", subagent_req_input)
-        self.assertIn("已完成三天详细行程并写入 /daily-itinerary.md", subagent_req_input)
+    async def test_main_and_subagent_each_execute_at_most_three_tools(self):
+        for role in ("main", "daily_planner"):
+            with self.subTest(role=role):
+                active = peak = 0
+                ready = asyncio.Event()
 
-    async def test_two_file_write_permissions_are_enforced(self):
-        # Main agent cannot write /daily-itinerary.md directly; Subagent cannot write /travel-outline.md
+                @tool
+                async def probe(index: int) -> str:
+                    """Offline concurrency probe."""
+                    nonlocal active, peak
+                    active += 1
+                    peak = max(peak, active)
+                    if active == 3:
+                        ready.set()
+                    await ready.wait()
+                    await asyncio.sleep(0.01)
+                    active -= 1
+                    return str(index)
+
+                self.agent = build_agent(self.model, [probe], checkpointer=self.saver)
+                batch = [("probe", {"index": index}) for index in range(7)]
+                if role == "main":
+                    steps = [batch, "查询完成。"]
+                else:
+                    steps = [
+                        ("task", {"subagent_type": "daily_planner", "description": "杭州三天两人"}),
+                        batch,
+                        ("write_file", {"file_path": "/daily-itinerary.md", "content": sample_plan()}),
+                        "完整行程已保存。",
+                        "行程已生成。",
+                    ]
+                await asyncio.wait_for(self.turn(
+                    "并发查询", *steps,
+                    config={"configurable": {"thread_id": f"parallel-{role}"}},
+                ), timeout=5)
+                self.assertEqual(peak, 3)
+                self.assertEqual(active, 0)
+
+    async def test_main_cannot_create_or_edit_itinerary(self):
         result = await self.turn(
-            "测试文件写权限边界",
-            ("write_file", {"file_path": "/daily-itinerary.md", "content": "主代理越权写入"}),
-            ("task", {"subagent_type": "daily_planner", "description": "测试子代理写权限边界"}),
-            ("write_file", {"file_path": "/travel-outline.md", "content": "子代理越权写入"}),
-            "子代理写 /travel-outline.md 被拒绝。",
-            "权限检查完成。",
+            "检查行程写入权限",
+            ("write_file", {"file_path": "/daily-itinerary.md", "content": "不应写入"}),
+            "写入被拒绝。",
         )
+        self.assertEqual(result["messages"][-2].status, "error")
         self.assertNotIn("/daily-itinerary.md", result.get("files", {}))
-        self.assertNotIn("/travel-outline.md", result.get("files", {}))
-        tool_msgs = [m for m in result["messages"] if m.type == "tool" and m.name == "write_file"]
-        self.assertEqual(len(tool_msgs), 1)
-        self.assertEqual(tool_msgs[0].status, "error")
+        await self.turn(
+            "请子代理保存行程",
+            ("task", {"subagent_type": "daily_planner", "description": "保存完整行程"}),
+            ("write_file", {"file_path": "/daily-itinerary.md", "content": "原始行程"}),
+            "已保存。", "行程已保存。",
+        )
+        result = await self.turn(
+            "检查行程修改权限",
+            ("edit_file", {"file_path": "/daily-itinerary.md", "old_string": "原始行程", "new_string": "不应修改"}),
+            ("read_file", {"file_path": "/daily-itinerary.md"}),
+            "修改被拒绝，仍可读取。",
+        )
+        self.assertEqual(result["messages"][-4].status, "error")
+        self.assertIn("原始行程", result["messages"][-2].text)
+
+    async def test_skills_remain_read_only(self):
+        result = await self.turn(
+            "检查skill写入边界",
+            ("write_file", {"file_path": "/skills/flyai/SKILL.md", "content": "不应写入"}),
+            "写入被拒绝。",
+        )
+        self.assertEqual(result["messages"][-2].status, "error")
 
     async def test_cli_rejects_non_search_command(self):
         with patch("agent.asyncio.create_subprocess_exec", new_callable=AsyncMock) as execute:
@@ -176,6 +272,26 @@ class AgentIntegrationTest(unittest.IsolatedAsyncioTestCase):
             )
             execute.assert_not_awaited()
             self.assertEqual(result["messages"][-2].status, "error")
+
+
+class ItineraryModelTest(unittest.TestCase):
+    def test_rejects_invalid_sequences_times_coordinates_and_costs(self):
+        cases = [
+            (lambda d: d["days"][0]["items"][0].update(cost=-1)),
+            (lambda d: d["days"][0]["items"][0].update(end_time="10:00")),
+            (lambda d: d["days"][0]["items"][1].update(start_time="11:30")),
+            (lambda d: d["days"][0]["items"].pop(1)),
+            (lambda d: d["days"][0]["items"][1].update(to_stop_id="missing")),
+            (lambda d: d["days"][0]["items"][2].update(id="d1-sight")),
+            (lambda d: d["days"][0]["items"][0]["coordinates"].update(latitude=100)),
+            (lambda d: d["days"][1].update(date="2026-11-01")),
+        ]
+        for mutate in cases:
+            with self.subTest(mutate=mutate):
+                data = sample_itinerary()
+                mutate(data)
+                with self.assertRaises(ValidationError):
+                    Itinerary.model_validate(data)
 
 
 if __name__ == "__main__":

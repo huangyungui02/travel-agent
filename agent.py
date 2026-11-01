@@ -20,6 +20,7 @@ from dotenv import load_dotenv
 from langchain.tools import tool
 from langchain_mcp_adapters.client import MultiServerMCPClient
 from langchain_openai import ChatOpenAI
+from daily_planner import build_daily_planner
 
 ROOT = Path(__file__).resolve().parent
 load_dotenv(ROOT / ".env")
@@ -70,7 +71,6 @@ def current_date() -> str:
 def build_agent(model, tools, *, checkpointer=None):
     """Compile the harness; LangGraph dev supplies its own persistence."""
     system_prompt = (ROOT / "system_prompt.md").read_text(encoding="utf-8")
-    daily_planner_prompt = (ROOT / "daily_planner_prompt.md").read_text(encoding="utf-8")
     register_harness_profile(
         "openai",
         HarnessProfile(
@@ -86,18 +86,7 @@ def build_agent(model, tools, *, checkpointer=None):
         default=StateBackend(),
         routes={"/skills/": FilesystemBackend(root_dir=ROOT / "skills", virtual_mode=True)},
     )
-    daily_planner = create_deep_agent(
-        name="daily_planner",
-        model=model,
-        tools=shared_tools,
-        backend=backend,
-        skills=["/skills/"],
-        permissions=[
-            FilesystemPermission(paths=["/skills/**", "/travel-outline.md"], operations=["write"], mode="deny"),
-        ],
-        system_prompt=daily_planner_prompt,
-        checkpointer=True,
-    )
+    daily_planner = build_daily_planner(model, shared_tools, backend)
     return create_deep_agent(
         name="travel_agent",
         model=model,
@@ -105,18 +94,19 @@ def build_agent(model, tools, *, checkpointer=None):
         backend=backend,
         skills=["/skills/"],
         permissions=[
-            FilesystemPermission(paths=["/skills/**", "/daily-itinerary.md"], operations=["write"], mode="deny"),
+            FilesystemPermission(paths=["/skills/**"], operations=["write"], mode="deny"),
+            FilesystemPermission(paths=["/daily-itinerary.md"], operations=["write"], mode="deny"),
         ],
         subagents=[
             {
                 "name": "daily_planner",
-                "description": "根据已确认的 /travel-outline.md 细化或修改每日具体行程，维护 /daily-itinerary.md 并返回摘要。",
+                "description": "根据已确认的旅行条件、预算与景点偏好统筹每日景点、餐厅和路线，通过原生文件工具保存 /daily-itinerary.md 完整 Markdown 行程，完成后简短报告；需要用户决定时说明问题。保留同一线程的历史，局部修改只需说明变更，无须重复全部需求。每轮只委派一次，保存全部天数的最新行程。",
                 "runnable": daily_planner,
             },
         ],
         system_prompt=system_prompt,
         checkpointer=checkpointer,
-    )
+    ).with_config(max_concurrency=3)
 
 
 async def graph(config):
@@ -131,8 +121,7 @@ async def graph(config):
         max_tokens=8192,
         use_responses_api=True,
         extra_body={"enable_thinking": False},
-        # Avoid bursts of parallel requests against Amap's QPS quota.
-        model_kwargs={"parallel_tool_calls": False},
+        model_kwargs={"parallel_tool_calls": True},
         use_previous_response_id=False,
         timeout=120,
         max_retries=2,
