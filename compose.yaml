@@ -6,10 +6,11 @@ services:
     env_file: .env
     environment:
       LANGSMITH_TRACING: "false"
+      TRAVEL_DATABASE: /app/data/travel.sqlite
     ports:
       - "127.0.0.1:8123:8123"
     volumes:
-      - agent-data:/app/.langgraph_api
+      - agent-data:/app/data
     stop_grace_period: 30s
     healthcheck:
       test:

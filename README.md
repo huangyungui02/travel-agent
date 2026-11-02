@@ -31,9 +31,9 @@
 
 ## Web 与 Docker 本地联调
 
-前端位于 `web/`，采用 React、TypeScript、Vite、React Router、Tailwind CSS 和 LangChain 官方 React SDK。支持流式聊天、历史会话、工具活动、停止后台任务，以及 Markdown 行程查看和下载。布局适配手机，后续可接入 Tauri；当前尚未加入 Tauri 工程。
+前端位于 `web/`，采用 React、TypeScript、Vite、React Router、Tailwind CSS 和原生 fetch/SSE。支持流式聊天、历史会话、工具活动、停止后台任务，以及 Markdown 行程查看和下载。布局适配手机，后续可接入 Tauri；当前尚未加入 Tauri 工程。
 
-当前按本地开发部署：Docker 内运行 `langgraph dev`，不需要 LangSmith。它使用开发运行时与持久卷，不是 PostgreSQL/Redis 生产版 Agent Server。没有用户鉴权，只绑定本机端口。
+正式部署使用 FastAPI + Uvicorn 单进程服务，SQLite 保存会话、运行状态与 LangGraph 检查点，无需 LangGraph Server、PostgreSQL 或 Redis。`langgraph dev` 仅用于本地 Agent / Studio 测试，不承担 Web 服务。当前没有用户鉴权，Compose 只绑定本机端口；个人远程访问建议通过 SSH 隧道或带认证的反向代理。
 
 先在项目根目录 `.env` 配置模型、高德和飞猪密钥，再启动 Docker 引擎：
 
@@ -51,9 +51,13 @@ npm ci --prefix web
 npm run dev --prefix web
 ```
 
-打开 http://localhost:5173 。Vite 默认将 `/api` 转发至 `http://127.0.0.1:8123`；使用已有非 Docker 服务时可用 `AGENT_SERVER_URL=http://127.0.0.1:2024 npm run dev --prefix web`。前端只读取 `VITE_AGENT_API_URL` 这一公开配置，绝不能把服务端密钥加上 `VITE_` 前缀。
+打开 http://localhost:5173 。Vite 默认将 `/api` 转发至 `http://127.0.0.1:8123`；使用已有非 Docker 服务时可用 `AGENT_SERVER_URL=http://127.0.0.1:8123 npm run dev --prefix web`。前端只读取 `VITE_AGENT_API_URL` 这一公开配置，绝不能把服务端密钥加上 `VITE_` 前缀。
 
-`langgraph.docker.json` 不读取镜像内的 `.env`，环境变量由 Compose 注入。它沿用本地开发运行时专用的启停清理策略：停止服务即取消任务，重启不恢复遗留任务；聊天和 `/daily-itinerary.md` 随 `/app/.langgraph_api` 保存在 `agent-data` 卷中。`docker compose down` 保留数据，`docker compose down -v` 会删除数据。
+SQLite 默认路径为 `data/travel.sqlite`，可通过 `TRAVEL_DATABASE` 配置。Compose 将其放在 `/app/data/travel.sqlite`，通过 `agent-data` 卷持久化。聊天、检查点与线程内 `/daily-itinerary.md` 一起保存。`docker compose down` 保留数据，`docker compose down -v` 会删除数据。备份时先停止 Agent，再备份整个数据目录（包含可能存在的 WAL 文件）。
+
+服务停止时取消未完成任务；重启将遗留任务标记为中断，不自动续跑，历史可通过新消息继续。关闭浏览器不会停止后台任务，重新打开会话会接回当前 SSE 进度。每个会话同时只运行一个任务；当前任务管理放在进程内，必须保持一个 Uvicorn worker、一个 Agent 实例。
+
+旧 `.langgraph_api` 数据不自动迁移到 SQLite；本地 Studio 和 FastAPI 各自使用独立数据。已有 Docker 卷中的旧开发数据不会被主动删除。
 
 ```bash
 # 检查服务与日志
@@ -63,7 +67,7 @@ docker compose logs -f agent
 docker compose down
 # 验证前端构建及 Python 集成
 npm run build --prefix web
-.venv/bin/python -m unittest test_agent -q
+.venv/bin/python -m unittest test_agent test_server -q
 # 浏览器测试，需已有 Vite 或 Docker Web 服务
 cd web
 npx playwright install chromium
@@ -120,15 +124,24 @@ FLYAI_API_KEY=你的飞猪密钥
 
 百炼密钥与接口地域须一致。高德 MCP 必须能连接并提供工具；飞猪支持试用，正式使用可配置 Key。密钥仅保存在本地 `.env`，已加入 gitignore。
 
-## 体验
+## 本地运行
+
+正式 Web 链路也可以不用 Docker，分别运行：
+
+```sh
+uv run uvicorn server:app --host 127.0.0.1 --port 8123 --workers 1
+npm run dev --prefix web
+```
+
+打开 http://localhost:5173 。API 文档位于 http://localhost:8123/docs 。启动和读取历史不连接模型或高德 MCP，实际发送消息时才加载工具。
+
+仅测试 Agent 时可运行：
 
 ```sh
 uv run langgraph dev
 ```
 
-打开终端输出的 Studio 链接，选择 `travel_agent`。启动时不连接远程工具，实际对话时才加载模型和高德 MCP。
-
-本地 dev 默认“关闭就停止”：正常关闭服务时取消未完成任务；重启时先取消上次遗留的 `pending`／`running` 任务，不自动续跑。对话历史、检查点和Markdown 行程文件仍然保留，可以由用户发送新消息继续。强制终止进程时，清理会在下次启动执行。此策略由 `dev_server.py` 的 HTTP lifespan 钩子实现，使用本地 in-memory runtime 的取消接口；升级服务端依赖后需验证生命周期顺序。若要恢复框架默认的重启续跑行为，移除 `langgraph.json` 中的 `http.app` 配置。关闭浏览器页面不等于关闭服务。
+打开终端输出的 Studio 链接，选择 `travel_agent`。这是独立的本地调试入口，使用 LangGraph dev 默认生命周期，不用于部署 Web。
 
 可以这样连续对话：
 
@@ -154,7 +167,8 @@ uv run python -m unittest -v
 
 - `agent.py`：主代理与工具组装、飞猪 CLI 查询、异步图工厂。
 - `daily_planner.py`：有历史的规划子代理配置。
-- `dev_server.py`：本地 dev 启停时取消未完成任务，保留对话和行程草稿。
+- `server.py`：FastAPI 会话接口、SQLite 检查点、SSE 进度与任务取消。
+- `test_server.py`：会话隔离、重启持久化、并发拒绝、取消与失败处理测试。
 - `system_prompt.md`：主代理需求沟通、自然语言委派与表格展示约定。
 - `daily_planner_prompt.md`：子代理的自然语言提交、记忆复用与查询约定。
 - `itinerary.py`：Pydantic 行程模型、连接与时序校验。

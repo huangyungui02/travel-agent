@@ -1,8 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useNavigate, useParams } from "react-router";
-import { useStream } from "@langchain/react";
-import { HumanMessage } from "@langchain/core/messages";
-import type { Thread } from "@langchain/langgraph-sdk";
 import {
   ArrowDownToLine,
   ArrowUp,
@@ -24,11 +21,10 @@ import {
   X,
 } from "lucide-react";
 import {
-  apiUrl,
-  assistantId,
+  useTravelStream,
+  type Thread,
   client,
   errorText,
-  type TravelState,
 } from "./api";
 import { Markdown } from "./Markdown";
 
@@ -53,7 +49,7 @@ const suggestions = [
   },
 ];
 
-function threadTitle(thread: Thread<TravelState>) {
+function threadTitle(thread: Thread) {
   const message = thread.values?.messages?.find(
     (message) => (message.type as string) === "human",
   );
@@ -75,7 +71,7 @@ const toolLabels: Record<string, string> = {
 export function App() {
   const { threadId } = useParams();
   const navigate = useNavigate();
-  const [threads, setThreads] = useState<Thread<TravelState>[]>([]);
+  const [threads, setThreads] = useState<Thread[]>([]);
   const [draft, setDraft] = useState("");
   const [localError, setLocalError] = useState<string | null>(null);
   const [connected, setConnected] = useState<boolean | null>(null);
@@ -100,17 +96,7 @@ export function App() {
     }
   }, []);
 
-  const stream = useStream<TravelState>({
-    apiUrl,
-    assistantId,
-    threadId: threadId ?? null,
-    onThreadId: (id) => {
-      void navigate(`/chat/${id}`, { replace: true });
-    },
-    onCompleted: () => {
-      void refreshThreads();
-    },
-  });
+  const stream = useTravelStream(threadId, refreshThreads);
   const itineraryContent =
     stream.values.files?.["/daily-itinerary.md"]?.content;
   const itinerary = Array.isArray(itineraryContent)
@@ -141,10 +127,8 @@ export function App() {
     setLocalError(null);
     setDraft("");
     try {
-      await stream.submit(
-        { messages: [new HumanMessage(text.trim())] },
-        { multitaskStrategy: "reject" },
-      );
+      const id = await stream.submit(text.trim());
+      if (id !== threadId) void navigate(`/chat/${id}`, { replace: true });
     } catch (error) {
       setLocalError(errorText(error));
     }
@@ -153,7 +137,7 @@ export function App() {
   async function stop() {
     setStopping(true);
     try {
-      await stream.stop({ cancel: true });
+      await stream.stop();
     } catch (error) {
       setLocalError(`停止任务失败：${errorText(error)}`);
     } finally {

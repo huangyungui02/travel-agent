@@ -1,7 +1,6 @@
 {
   "dependencies": ["."],
   "graphs": {"travel_agent": "./agent.py:graph"},
-  "http": {"app": "./dev_server.py:app"},
   "env": ".env",
   "python_version": "3.12"
 }

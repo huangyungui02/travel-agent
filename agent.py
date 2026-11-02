@@ -72,7 +72,7 @@ def current_date() -> str:
 
 
 def build_agent(model, tools, *, checkpointer=None):
-    """Compile the harness; LangGraph dev supplies its own persistence."""
+    """Compile with application persistence; LangGraph dev can supply its own."""
     system_prompt = (ROOT / "system_prompt.md").read_text(encoding="utf-8")
     register_harness_profile(
         "openai",
@@ -112,7 +112,7 @@ def build_agent(model, tools, *, checkpointer=None):
     ).with_config(max_concurrency=3)
 
 
-async def graph(config):
+async def graph(config, *, checkpointer=None):
     """Load remote MCP tools at run time, so server startup stays offline."""
     key = os.getenv("DASHSCOPE_API_KEY", "").strip()
     if not key:
@@ -144,4 +144,4 @@ async def graph(config):
         raise RuntimeError("高德 MCP 连接失败，请检查 API Key、权限和网络。") from None
     if not tools:
         raise RuntimeError("高德 MCP 未返回可用工具，请检查服务状态与权限。")
-    return build_agent(model, tools)
+    return build_agent(model, tools, checkpointer=checkpointer)

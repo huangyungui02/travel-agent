@@ -49,43 +49,20 @@ test("desktop, mobile and suggestion composer", async ({ page }) => {
 for (const legacy of [false, true]) {
   test(`restores ${legacy ? "legacy array" : "current string"} Markdown file, downloads and isolates new chat`, async ({
     page,
-    request,
   }) => {
-    const response = await request.post("/api/threads", {
-      data: { metadata: { graph_id: "travel_agent", title: "界面联调" } },
-    });
-    expect(response.ok()).toBeTruthy();
-    const { thread_id: id } = await response.json();
-    created.push(id);
-    const update = await request.post(`/api/threads/${id}/state`, {
-      data: {
-        values: {
-          messages: [
-            { type: "human", content: "杭州旅行测试", id: "fixture-human" },
-            {
-              type: "ai",
-              content: "行程已保存，可以查看草稿。",
-              id: "fixture-ai",
-            },
-          ],
-          files: {
-            "/daily-itinerary.md": {
-              content: legacy ? itinerary.split("\n") : itinerary,
-              encoding: "utf-8",
-              created_at: new Date().toISOString(),
-              modified_at: new Date().toISOString(),
-            },
-          },
-        },
-        as_node: "model",
+    const id = `fixture-${legacy ? "legacy" : "string"}`;
+    const fixture = {
+      thread_id: id, status: "idle",
+      values: {
+        messages: [
+          { type: "human", content: "杭州旅行测试", id: "fixture-human" },
+          { type: "ai", content: "行程已保存，可以查看草稿。", id: "fixture-ai" },
+        ],
+        files: { "/daily-itinerary.md": { content: legacy ? itinerary.split("\n") : itinerary } },
       },
-    });
-    expect(update.ok(), await update.text()).toBeTruthy();
-    // A seeded checkpoint must be terminal, like a successfully completed run.
-    const finished = await request.post(`/api/threads/${id}/state`, {
-      data: { values: null, as_node: "__end__" },
-    });
-    expect(finished.ok(), await finished.text()).toBeTruthy();
+    };
+    await page.route(`**/api/threads/${id}`, (route) => route.fulfill({ json: fixture }));
+    await page.route("**/api/threads/search", (route) => route.fulfill({ json: [fixture] }));
     await page.goto(`/chat/${id}`);
     await expect(page.getByText("行程已保存，可以查看草稿。")).toBeVisible();
     await page.getByRole("button", { name: "行程草稿", exact: true }).click();
@@ -194,4 +171,39 @@ test("stop cancels the server run", async ({ page, request }) => {
   await expect(
     page.getByRole("button", { name: "开始新的旅行" }),
   ).toBeEnabled();
+});
+
+test("FastAPI send, SSE messages and tool activity", async ({ page }) => {
+  const thread = {
+    thread_id: "stream-fixture", status: "busy",
+    values: { messages: [{ id: "human", type: "human", content: "杭州" }] },
+  };
+  await page.route("**/api/threads/search", (route) => route.fulfill({ json: [] }));
+  await page.route("**/api/threads", (route) => route.fulfill({ json: thread }));
+  await page.route("**/api/threads/stream-fixture", (route) => route.fulfill({ json: thread }));
+  await page.route("**/api/threads/stream-fixture/runs", async (route) => {
+    expect(route.request().postDataJSON()).toEqual({ message: "杭州" });
+    await route.fulfill({ json: { run_id: "run-fixture", status: "running" } });
+  });
+  await page.route("**/api/threads/stream-fixture/events", (route) => route.fulfill({
+    contentType: "text/event-stream",
+    body: `data: ${JSON.stringify({ status: "success", values: {
+      messages: [
+        ...thread.values.messages,
+        { id: "call", type: "ai", content: "", tool_calls: [{ id: "date", name: "current_date" }] },
+        { id: "tool", type: "tool", content: "2026-11-02", tool_call_id: "date", status: "success" },
+        { id: "answer", type: "ai", content: [{ type: "text", text: "一起规划杭州旅行。" }] },
+      ], files: { "/daily-itinerary.md": { content: itinerary } },
+    } })}\n\n`,
+  }));
+  await page.goto("/chat");
+  await page.getByRole("textbox", { name: "旅行想法" }).fill("杭州");
+  await page.getByRole("button", { name: "发送消息" }).click();
+  await expect(page).toHaveURL(/\/chat\/stream-fixture$/);
+  await expect(page.getByText("一起规划杭州旅行。")).toBeVisible();
+  await expect(page.getByRole("button", { name: "停止生成" })).toHaveCount(0);
+  await page.locator(".tool-activity summary").click();
+  await expect(page.getByText("确认旅行日期", { exact: true })).toBeVisible();
+  await page.getByRole("button", { name: "行程草稿", exact: true }).click();
+  await expect(page.getByRole("heading", { name: "杭州一日游" })).toBeVisible();
 });
